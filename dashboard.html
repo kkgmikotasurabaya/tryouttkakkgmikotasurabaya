@@ -2214,11 +2214,147 @@ function loadQList() {
         } else { $('#q-list-container').html(topActions + '<div class="alert alert-info text-center rounded-4 shadow-sm mt-4"><i class="fas fa-info-circle fa-2x mb-2 d-block"></i>Belum ada data. Silakan klik Tambah Baru.</div>'); }
     })
     .withFailureHandler(err => {
-        $('#q-list-container').html(`<div class="alert alert-danger">Gagal memuat soal: ${err.message}</div>`);
+        $('#q-list-container').html(`
+            <div class="alert alert-danger rounded-4 shadow-sm p-4 text-center">
+                <h6 class="fw-bold mb-2"><i class="fas fa-exclamation-triangle me-2"></i>Gagal memuat soal: ${err.message}</h6>
+                <p class="small text-dark mb-3">Biasanya disebabkan ukuran gambar (copy-paste) terlalu besar. Klik tombol di bawah untuk mengompres otomatis semua gambar tanpa menghapus soal.</p>
+                <button class="btn btn-warning fw-bold rounded-pill px-4 shadow-sm" onclick="kompresSemuaGambarUjian()">
+                    <i class="fas fa-compress-arrows-alt me-2"></i> Kompres Paksa Gambar Soal Ini
+                </button>
+            </div>
+        `);
     })
     .getExamQuestions(activeExamId);
 }
+function compressSingleBase64(base64Str, maxW = 550, quality = 0.65) {
+    return new Promise((resolve) => {
+        const img = new Image();
+        img.onload = function() {
+            const canvas = document.createElement('canvas');
+            const scale = img.width > maxW ? maxW / img.width : 1;
+            canvas.width = Math.round(img.width * scale);
+            canvas.height = Math.round(img.height * scale);
+            const ctx = canvas.getContext('2d');
+            // Beri latar putih agar gambar PNG transparan tidak berubah jadi hitam
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            const result = canvas.toDataURL('image/jpeg', quality);
+            resolve(result.length < base64Str.length ? result : base64Str);
+        };
+        img.onerror = function() { resolve(base64Str); };
+        img.src = base64Str;
+    });
+}
 
+async function compressBase64InText(text) {
+    if (!text || typeof text !== 'string') return { text, changed: false };
+    const regex = /data:image\/[a-zA-Z0-9+.-]+;base64,[A-Za-z0-9+/=]+/g;
+    const matches = text.match(regex);
+    if (!matches) return { text, changed: false };
+
+    let newText = text;
+    let changed = false;
+    const uniqueMatches = [...new Set(matches)];
+
+    for (const b64 of uniqueMatches) {
+        // Hanya kompres gambar yang ukurannya lebih dari ~40 KB
+        if (b64.length > 55000) {
+            const compressed = await compressSingleBase64(b64);
+            if (compressed !== b64) {
+                newText = newText.split(b64).join(compressed);
+                changed = true;
+            }
+        }
+    }
+    return { text: newText, changed };
+}
+
+async function kompresSemuaGambarUjian() {
+    if (!activeExamId) return;
+
+    Swal.fire({
+        title: 'Memeriksa Daftar Soal...',
+        html: 'Mohon jangan tutup halaman ini.',
+        allowOutsideClick: false,
+        didOpen: () => Swal.showLoading()
+    });
+
+    try {
+        const listRes = await new Promise((resolve, reject) => {
+            google.script.run.withSuccessHandler(resolve).withFailureHandler(reject).getQuestionIds(activeExamId);
+        });
+
+        if (listRes.status !== 'success' || !listRes.data || listRes.data.length === 0) {
+            return Swal.fire('Info', 'Tidak ada soal ditemukan pada ujian ini.', 'info');
+        }
+
+        const qList = listRes.data;
+        let compressedCount = 0;
+
+        for (let i = 0; i < qList.length; i++) {
+            const qItem = qList[i];
+            Swal.update({
+                title: `Mengompres Soal ${i + 1} / ${qList.length}`,
+                html: `Memeriksa gambar pada soal nomor <b>${qItem.Nomor || (i + 1)}</b>...`
+            });
+
+            const qRes = await new Promise((resolve, reject) => {
+                google.script.run.withSuccessHandler(resolve).withFailureHandler(reject).getSingleQuestion(qItem.QID);
+            });
+
+            if (qRes.status !== 'success' || !qRes.data) continue;
+            const q = qRes.data;
+            let isModified = false;
+
+            // 1. Kompres gambar di Pertanyaan
+            const resP = await compressBase64InText(q.Pertanyaan);
+            let newPertanyaan = resP.text;
+            if (resP.changed) isModified = true;
+
+            // 2. Kompres gambar di Opsi Jawaban
+            let newOptions = q.Options || '[]';
+            try {
+                const arrOpt = JSON.parse(newOptions);
+                if (Array.isArray(arrOpt)) {
+                    for (let j = 0; j < arrOpt.length; j++) {
+                        const rOpt = await compressBase64InText(arrOpt[j]);
+                        if (rOpt.changed) { arrOpt[j] = rOpt.text; isModified = true; }
+                    }
+                    newOptions = JSON.stringify(arrOpt);
+                }
+            } catch (e) {}
+
+            // 3. Kompres gambar di Kunci Jawaban (jika tipe Menjodohkan/PG ber-gambar)
+            let newKey = q.Key || '[]';
+            try {
+                const arrKey = JSON.parse(newKey);
+                if (Array.isArray(arrKey)) {
+                    for (let k = 0; k < arrKey.length; k++) {
+                        const rKey = await compressBase64InText(arrKey[k]);
+                        if (rKey.changed) { arrKey[k] = rKey.text; isModified = true; }
+                    }
+                    newKey = JSON.stringify(arrKey);
+                }
+            } catch (e) {}
+
+            // Simpan kembali ke Turso hanya jika ada gambar yang berhasil diperkecil
+            if (isModified) {
+                await new Promise((resolve, reject) => {
+                    google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)
+                    .updateCompressedQuestion(q.QID, newPertanyaan, newOptions, newKey);
+                });
+                compressedCount++;
+            }
+        }
+
+        Swal.fire('Selesai!', `Berhasil mengompres gambar pada <b>${compressedCount}</b> soal. Memuat ulang daftar soal...`, 'success')
+            .then(() => loadQList());
+
+    } catch (err) {
+        Swal.fire('Gagal', err.message || 'Terjadi kesalahan saat mengompres.', 'error');
+    }
+}
 function generateQHTML(q) {
     let inp = '';
     let cleanedQuestion = decodeHTML(q.Pertanyaan);
