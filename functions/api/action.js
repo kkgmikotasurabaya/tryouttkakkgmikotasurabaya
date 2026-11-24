@@ -215,7 +215,30 @@ export async function onRequestPost(context) {
       if (action === 'getSiswaSoal') return jsonResponse({ status: 'success', data: qs.rows });
       return jsonResponse(qs.rows);
     }
+if (action === 'getQuestionIds') {
+      const qs = await turso.execute({
+        sql: "SELECT QID, Nomor FROM Questions WHERE ExamID = ? ORDER BY Nomor ASC",
+        args: [args[0] || '']
+      });
+      return jsonResponse({ status: 'success', data: qs.rows });
+    }
 
+    if (action === 'getSingleQuestion') {
+      const q = await turso.execute({
+        sql: "SELECT QID, Pertanyaan, Options, Key FROM Questions WHERE QID = ?",
+        args: [args[0] || '']
+      });
+      return jsonResponse({ status: 'success', data: q.rows[0] || null });
+    }
+
+    if (action === 'updateCompressedQuestion') {
+      const [qid, pertanyaan, options, key] = args;
+      await turso.execute({
+        sql: "UPDATE Questions SET Pertanyaan = ?, Options = ?, Key = ? WHERE QID = ?",
+        args: [pertanyaan || '', options || '[]', key || '[]', qid || '']
+      });
+      return jsonResponse({ status: 'success' });
+    }
     if (action === 'adminSaveSingleQuestion') {
       const [eid, d, userId] = args; const id = d.id || ('Q' + Date.now());
       const cek = await turso.execute({ sql: "SELECT QID FROM Questions WHERE QID = ?", args: [id] });
