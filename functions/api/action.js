@@ -128,12 +128,16 @@ export async function onRequestPost(context) {
           output.kuotaSiswa = selfData.rows[0]?.KuotaSiswa || 0;
         }
       } else if (role === 'siswa') {
-        output.availableExams = exams.rows.filter(e => e.Status === 'Aktif');
         const history = await turso.execute({
           sql: "SELECT r.ResultID, r.ExamID, r.WaktuSubmit, r.TotalNilai as Nilai, e.Judul, e.AllowDownloadR, e.AllowDownloadQ, e.ShowStats, r.Pelanggaran FROM Results r JOIN Exams e ON r.ExamID = e.ExamID WHERE r.SiswaID = ? AND e.Mapel != 'SURVEY'",
           args: [userId || '']
         });
         output.history = history.rows;
+        const finishedIds = new Set(history.rows.map(h => String(h.ExamID)));
+        output.availableExams = exams.rows
+          .filter(e => e.Status === 'Aktif')
+          .map(e => ({ ...e, IsFinished: finishedIds.has(String(e.ExamID)) }));
+
         const userSelf = await turso.execute({ sql: "SELECT Sesi FROM Users WHERE ID = ?", args: [userId || ''] });
         if (userSelf.rows.length > 0) output.userSesi = userSelf.rows[0].Sesi;
       }
@@ -357,14 +361,16 @@ if (action === 'getQuestionIds') {
       });
 
       const finalScore100 = maxPossibleTotalScore > 0 ? Math.round((rawTotalScore / maxPossibleTotalScore) * 10000) / 100 : 0;
+      const uniqueResId = 'RES_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+
       await turso.execute({
         sql: "INSERT INTO Results (ResultID, SiswaID, ExamID, TotalNilai, Detail, Pelanggaran, WaktuSubmit) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        args: ['RES' + Date.now(), uid || '', eid || '', finalScore100, JSON.stringify(detailLog), violations > 0 ? `Pelanggaran: ${violations}x` : "-", waktuSubmit]
+        args: [uniqueResId, uid || '', eid || '', finalScore100, JSON.stringify(detailLog), violations > 0 ? `Pelanggaran: ${violations}x` : "-", waktuSubmit]
       });
       try { await turso.execute({ sql: "UPDATE Users SET Status='Selesai Ujian TKA', Terjawab=0 WHERE ID=?", args: [uid || ''] }); } catch (e) {}
       return jsonResponse({ status: 'success', msg: 'Berhasil dikirim', data: { score: finalScore100 } });
     }
-
+    
     if (action === 'getRecapList') {
       const [role, , sekolah] = args;
       let sql = `SELECT r.ResultID, r.TotalNilai, r.WaktuSubmit, r.SiswaID, r.ExamID, r.Pelanggaran, COALESCE(u.Nama, 'Akun Telah Dihapus') AS NamaSiswa, COALESCE(u.Kelas, '-') AS KelasSiswa, COALESCE(u.Sekolah, '-') AS SekolahSiswa, e.Judul AS JudulUjian, e.Mapel AS Mapel, e.PembuatID AS PembuatID, e.ShowStats AS ShowStats, (SELECT Nama FROM Users WHERE ID = e.PembuatID) AS PembuatNama FROM Results r LEFT JOIN Users u ON r.SiswaID = u.ID LEFT JOIN Exams e ON r.ExamID = e.ExamID WHERE 1=1`;
