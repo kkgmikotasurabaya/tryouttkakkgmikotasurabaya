@@ -500,18 +500,18 @@ function checkResumeExam() {
     if(savedExam) {
         try {
             const examState = JSON.parse(savedExam);
-            if(examState && examState.id) {
-                Swal.fire({ title: 'Lanjutkan Ujian?', text: 'Terdeteksi sesi ujian yang belum selesai.', icon: 'info', confirmButtonText: 'Lanjutkan', allowOutsideClick: false }).then(() => {
+            if(examState && examState.id && (!examState.userId || examState.userId === user.ID)) {
+                Swal.fire({ title: 'Lanjutkan Ujian?', text: 'Terdeteksi sesi ujian yang belum selesai. Jawaban Anda sebelumnya tetap tersimpan.', icon: 'info', confirmButtonText: 'Lanjutkan', allowOutsideClick: false }).then(() => {
                     activeExamId = examState.id; totalQ = examState.qs.length;
                     $('#do-exam-title').text(user.Nama);
                     if (document.documentElement.requestFullscreen) { document.documentElement.requestFullscreen().catch(()=>{}); }
+                    enableSecurity();
                     runExam(examState.qs, examState.dur, true);
                 });
             }
         } catch(e) { localStorage.removeItem('cbt_active_exam'); }
     }
 }
-
 function toggleSidebar() { $('#sidebar').toggleClass('active'); $('#sidebar-overlay').toggleClass('active'); }
 function showLoad(s) { s ? $('#loader').removeClass('hidden') : $('#loader').addClass('hidden'); }
 function toast(icon, title) { Swal.mixin({toast: true, position: 'top-end', showConfirmButton: false, timer: 3000}).fire({icon: icon, title: title}); }
@@ -915,49 +915,67 @@ function renderUserRows(data) {
 }
 
 function handleUploadUsersExcel(e) {
-    const file = e.target.files[0]; if(!file) return;
+    const file = e.target.files[0]; if (!file) return;
     const reader = new FileReader();
     reader.onload = function(evt) {
         const data = new Uint8Array(evt.target.result);
-        const workbook = XLSX.read(data, {type: 'array', cellDates: true, dateNF: 'yyyy-mm-dd'});
+        const workbook = XLSX.read(data, { type: 'array', cellDates: true, dateNF: 'yyyy-mm-dd' });
         const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-        const json = XLSX.utils.sheet_to_json(firstSheet, {raw: false});
-        
+        const json = XLSX.utils.sheet_to_json(firstSheet, { raw: false });
+
+        const roleStr = String(user.Role).trim().toLowerCase();
         let formattedData = json.map(row => {
             return {
                 id: 'S-' + Date.now() + Math.random().toString(36).substr(2, 9),
                 nama: row['Nama'] || '',
                 username: String(row['Username'] || '').trim(),
                 password: String(row['Password'] || '').trim(),
-                role: String(row['Role'] || 'siswa').toLowerCase(),
-                sekolah: row['Sekolah'] || '',
+                role: roleStr === 'guru' ? 'siswa' : String(row['Role'] || 'siswa').toLowerCase(),
+                sekolah: roleStr === 'guru' ? (user.Sekolah || '') : (row['Sekolah'] || ''),
                 kelas: String(row['Kelas'] || ''),
                 sesi: String(row['Sesi'] || '1'),
                 tglLahir: row['TglLahir'] || ''
             };
         }).filter(u => u.username !== '');
-        
-        if(formattedData.length === 0) return Swal.fire('Error', 'Format data tidak valid.', 'error');
-        const roleStr = String(user.Role).trim().toLowerCase();
+
+        if (formattedData.length === 0) return Swal.fire('Error', 'Format data tidak valid.', 'error');
+
         if (roleStr === 'guru') {
             let currentSiswaCount = window.allUsersData.length;
             if (currentSiswaCount + formattedData.length > user.KuotaSiswa) {
                 return Swal.fire('Kuota Tidak Cukup', `Anda mencoba mengupload ${formattedData.length} siswa, tapi sisa kuota Anda hanya ${user.KuotaSiswa - currentSiswaCount} peserta. Hubungi Admin jika ingin menambah kuota.`, 'warning');
             }
         }
-        
-        Swal.fire({ title: `Upload ${formattedData.length} Peserta?`, icon: 'question', showCancelButton: true }).then(async r => {
-            if(r.isConfirmed) {
+
+        Swal.fire({
+            title: `Upload ${formattedData.length} Peserta?`,
+            text: 'Menggunakan mode cepat (Batch 100 data per pengiriman).',
+            icon: 'question',
+            showCancelButton: true
+        }).then(async r => {
+            if (r.isConfirmed) {
                 showLoad(true);
-                let successCount = 0; let failCount = 0;
-                for(let u of formattedData) {
+                let successCount = 0;
+                let failCount = 0;
+                const chunkSize = 100;
+
+                for (let i = 0; i < formattedData.length; i += chunkSize) {
+                    const chunk = formattedData.slice(i, i + chunkSize);
                     await new Promise(resolve => {
                         google.script.run
-                        .withSuccessHandler((res) => { if(res && res.status==='success') successCount++; else failCount++; resolve(); })
-                        .withFailureHandler(() => { failCount++; resolve(); })
-                        .adminManageUser('save', u);
+                        .withSuccessHandler((res) => {
+                            if (res && res.status === 'success') successCount += chunk.length;
+                            else failCount += chunk.length;
+                            resolve();
+                        })
+                        .withFailureHandler(() => {
+                            failCount += chunk.length;
+                            resolve();
+                        })
+                        .adminBatchSaveUsers(chunk);
                     });
                 }
+
                 showLoad(false);
                 Swal.fire('Selesai', `Berhasil upload ${successCount} peserta. ${failCount > 0 ? `(${failCount} gagal)` : ''}`, 'success');
                 loadPage('admin-users');
@@ -970,21 +988,21 @@ function handleUploadUsersExcel(e) {
 
 async function handleBulkPhotoUpload(event) {
     const files = event.target.files;
-    if(!files || files.length === 0) return;
+    if (!files || files.length === 0) return;
 
     let uploadQueue = [];
-    for(let i = 0; i < files.length; i++) {
+    for (let i = 0; i < files.length; i++) {
         let file = files[i];
         let filename = file.name.substring(0, file.name.lastIndexOf('.')) || file.name;
         let matchedUser = window.allUsersData.find(u => String(u.Username).toLowerCase() === String(filename).toLowerCase());
-        
-        if(matchedUser) {
+
+        if (matchedUser) {
             let base64str = await new Promise((resolve) => {
                 let reader = new FileReader();
                 reader.onloadend = () => resolve(reader.result);
                 reader.readAsDataURL(file);
             });
-            
+
             let updatedUser = {
                 id: matchedUser.ID || matchedUser.id,
                 nama: matchedUser.Nama,
@@ -1002,7 +1020,7 @@ async function handleBulkPhotoUpload(event) {
     }
 
     event.target.value = '';
-    if(uploadQueue.length === 0) {
+    if (uploadQueue.length === 0) {
         return Swal.fire('Tidak Ada Kecocokan', 'Tidak ada nama file foto yang cocok dengan Username peserta. Pastikan nama file sama persis dengan username (cth: siswa01.jpg).', 'info');
     }
 
@@ -1013,10 +1031,10 @@ async function handleBulkPhotoUpload(event) {
         showCancelButton: true,
         confirmButtonText: 'Ya, Upload Sekarang'
     }).then(async (r) => {
-        if(r.isConfirmed) {
+        if (r.isConfirmed) {
             showLoad(true);
             let successCount = 0;
-            for(let data of uploadQueue) {
+            for (let data of uploadQueue) {
                 await new Promise(resolve => {
                     google.script.run
                         .withSuccessHandler(() => { successCount++; resolve(); })
@@ -1030,7 +1048,6 @@ async function handleBulkPhotoUpload(event) {
         }
     });
 }
-
 function applyFilterUsers() {
     let kataKunci = $('#filter-user-nama').val().toLowerCase();
     let sekolah = $('#filter-user-sekolah').val();
@@ -2677,7 +2694,7 @@ function startExam(eid) {
     </div>`;
 
     let htmlContent = rules;
-    if(reqToken) {
+    if (reqToken) {
         htmlContent = `<div class="alert alert-info small text-start"><i class="fas fa-lock me-1"></i> Ujian ini dikunci. Silakan masukkan <b>Token Masuk Ujian</b> yang diberikan oleh Pengawas:</div>
         <input type="text" id="swal-token-input" class="form-control text-center text-uppercase fw-bold mb-3" placeholder="Ketik Token di sini..." style="font-size:18px; letter-spacing: 2px;">` + rules;
     }
@@ -2690,13 +2707,13 @@ function startExam(eid) {
         confirmButtonText: '<i class="fas fa-play me-1"></i> SETUJU & MULAI', 
         confirmButtonColor: '#0f5132',
         preConfirm: () => {
-            if(reqToken) {
+            if (reqToken) {
                 const val = $('#swal-token-input').val().toUpperCase().trim();
-                if(!val) {
+                if (!val) {
                     Swal.showValidationMessage('Token wajib diisi!');
                     return false;
                 }
-                if(val !== reqToken) {
+                if (val !== reqToken) {
                     Swal.showValidationMessage('Token yang Anda masukkan SALAH!');
                     return false;
                 }
@@ -2704,31 +2721,46 @@ function startExam(eid) {
             return true;
         }
     }).then(r => {
-        if(r.isConfirmed) {
-            initAudio(); // Inisialisasi Audio saat ada interaksi user pertama kali
-            if (document.documentElement.requestFullscreen) { document.documentElement.requestFullscreen().catch((err) => {}); }
+        if (r.isConfirmed) {
+            initAudio();
+            if (document.documentElement.requestFullscreen) {
+                document.documentElement.requestFullscreen().catch(() => {});
+            }
             showLoad(true);
             google.script.run
             .withSuccessHandler(res => {
                 showLoad(false);
-                if(res.status === 'success') {
-                    localStorage.removeItem(`ANS_${user.ID}_${eid}`);
-                    activeExamId = eid; totalQ = res.data.length;
+                if (res.status === 'success') {
+                    // JANGAN hapus ANS_${user.ID}_${eid} agar jawaban sebelumnya tetap pulih jika sempat keluar mendadak
+                    activeExamId = eid;
+                    totalQ = res.data.length;
                     $('#do-exam-title').text(user.Nama);
-                    try { localStorage.setItem('cbt_active_exam', JSON.stringify({ id: eid, qs: res.data, dur: res.duration, start: Date.now(), judul: res.judul, token: res.token })); } catch(e) {}
-                    violationCount = 0; enableSecurity(); runExam(res.data, res.duration, false);
+                    try {
+                        localStorage.setItem('cbt_active_exam', JSON.stringify({
+                            userId: user.ID,
+                            id: eid,
+                            qs: res.data,
+                            dur: res.duration,
+                            start: Date.now(),
+                            judul: res.judul,
+                            token: res.token
+                        }));
+                    } catch (e) {}
+                    violationCount = 0;
+                    enableSecurity();
+                    runExam(res.data, res.duration, false);
                 } else {
-                    Swal.fire('Gagal Memulai', res.msg, 'error'); // Menampilkan pesan penolakan dari server jika perangkat terkunci
+                    Swal.fire('Gagal Memulai', res.msg, 'error');
                 }
             })
             .withFailureHandler(err => {
-                showLoad(false); Swal.fire('Error', err.message || 'Kesalahan koneksi', 'error');
+                showLoad(false);
+                Swal.fire('Error', err.message || 'Kesalahan koneksi', 'error');
             })
-            .getExamPack(eid, user.ID, deviceId); // UPDATE: Menyertakan argumen deviceId
+            .getExamPack(eid, user.ID, deviceId);
         }
     });
-}
-    
+}    
 function enableSecurity() { 
     violationCount = 0; isExamFinished = false; violationLock = false; 
     document.addEventListener("visibilitychange", handleVisibilityChange); 
@@ -2853,6 +2885,7 @@ function processSubmission(retryCount = 0) {
 function changeFontSize(size) { $('.q-content').css('font-size', size + 'px'); }
 
 function runExam(qs, dur, isResume) {
+// PERBAIKAN: Reset status pengiriman & tombol selesai setiap kali ujian dimulai/dilanjutkan examSubmitting = false; isExamFinished = false; violationLock = false; $('#btn-finish').prop('disabled', false).html('<i class="fas fa-check-circle me-2"></i> Selesai Ujian');
     $('#view-dashboard').addClass('hidden'); $('#view-exam').removeClass('hidden'); $('body').addClass('exam-mode');
     const c = $('#q-slides-container'); const g = $('#nav-grid'); c.empty(); g.empty();
     qs.forEach((q,i) => {
